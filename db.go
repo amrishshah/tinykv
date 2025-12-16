@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 var (
@@ -90,8 +91,8 @@ func (tx *Tx) Get(key string) (string, error) {
 
 func (tx *Tx) Rollback() error {
 	tx.mu.Lock()
-	defer tx.db.mu.Unlock() // Executes SECOND ✅
-	defer tx.mu.Unlock()    // Executes FIRST ✅
+	defer tx.db.mu.Unlock()
+	defer tx.mu.Unlock()
 	if !tx.active {
 		return ErrTxNotActive
 	}
@@ -102,10 +103,15 @@ func (tx *Tx) Rollback() error {
 
 func (tx *Tx) Commit() error {
 	tx.mu.Lock()
-	defer tx.db.mu.Unlock() // Executes SECOND ✅
-	defer tx.mu.Unlock()    // Executes FIRST ✅
+	defer tx.db.mu.Unlock()
+	defer tx.mu.Unlock()
 	if !tx.active {
 		return ErrTxNotActive
+	}
+
+	// Flush any pending batched writes
+	if err := tx.db.Flush(); err != nil {
+		return err
 	}
 
 	if err := tx.db.Write("BEGIN_TX"); err != nil {
@@ -154,6 +160,265 @@ type DB struct {
 	lastSnapshot uint64 // NEW - operation count at last snapshot
 	opsSinceSnap uint64 // NEW - operations since last snapshot
 
+	writeBatch   []logEntry
+	batchMu      sync.Mutex
+	batchSize    int
+	flushTimeout time.Duration
+
+	// Background flusher
+	flushSignal  chan struct{}  // Signal to flush immediately
+	shutdownChan chan struct{}  // Signal to stop background goroutine
+	flushDone    sync.WaitGroup // Wait for flusher to finish
+
+}
+
+type logEntry struct {
+	op    string // SET and DELETE
+	key   string
+	value string // empty for delete
+}
+
+func Open(dir string) (*DB, error) {
+
+	//WAL
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		return nil, fmt.Errorf("directory does not exist: %s", dir)
+	}
+
+	walPath := filepath.Join(dir, "wal.log")
+	snapshotPath := filepath.Join(dir, "snapshot.db")
+
+	db := &DB{
+		data:         make(map[string]string),
+		walPath:      walPath,
+		snapshotPath: snapshotPath,
+		writeBatch:   make([]logEntry, 0, 100),
+		batchSize:    100,
+		flushTimeout: 10 * time.Millisecond,
+		flushSignal:  make(chan struct{}, 1),
+		shutdownChan: make(chan struct{}),
+	}
+
+	//loadSnashot
+	if err := db.LoadSnapshot(); err != nil {
+		return nil, err
+	}
+
+	wal, err := os.OpenFile(walPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open WAL: %w", err)
+	}
+
+	db.wal = wal
+
+	// 5. Replay log
+	if err := db.Replay(); err != nil {
+		wal.Close()
+		return nil, err
+	}
+
+	db.startBackgroundFlusher()
+
+	return db, nil
+}
+
+func (db *DB) Replay() error {
+	if _, err := db.wal.Seek(0, 0); err != nil {
+		return fmt.Errorf("failed to seek: %w", err)
+	}
+
+	scanner := bufio.NewScanner(db.wal)
+	inTx := false
+	txWrites := make(map[string]*string)
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		parts := strings.Split(line, "\t")
+		if len(parts) < 1 {
+			continue
+		}
+
+		switch parts[0] {
+		case "BEGIN_TX":
+			inTx = true
+			txWrites = make(map[string]*string)
+
+		case "COMMIT_TX":
+			if inTx {
+				for key, value := range txWrites {
+					if value == nil {
+						delete(db.data, key)
+					} else {
+						db.data[key] = *value
+					}
+				}
+			}
+			inTx = false
+			txWrites = make(map[string]*string)
+
+		case "SET":
+			if len(parts) != 3 {
+				continue
+			}
+			if inTx {
+				v := parts[2]
+				txWrites[parts[1]] = &v
+			} else {
+				db.data[parts[1]] = parts[2]
+			}
+
+		case "DELETE":
+			if len(parts) != 2 {
+				continue
+			}
+			if inTx {
+				txWrites[parts[1]] = nil
+			} else {
+				delete(db.data, parts[1])
+			}
+		}
+	}
+
+	return scanner.Err()
+}
+
+func (db *DB) Write(data string) error {
+	_, err := db.wal.Write([]byte(data + "\n"))
+	if err != nil {
+		return err
+	}
+	return db.wal.Sync()
+}
+
+func (db *DB) Set(key, value string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		return ErrDBClosed
+	}
+	// if err := db.Write("SET\t" + key + "\t" + value); err != nil {
+	// 	return err
+	// }
+
+	db.AddtoBatch(logEntry{
+		op:    "SET",
+		key:   key,
+		value: value,
+	})
+
+	db.data[key] = value
+	db.opsSinceSnap++
+
+	if db.opsSinceSnap >= compactionThreshold {
+		if err := db.Flush(); err != nil {
+			return err
+		}
+		if err := db.CompactwithoutLock(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (db *DB) Get(key string) (string, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		return "", ErrDBClosed
+	}
+	value, exists := db.data[key]
+	if !exists {
+		return "", ErrKeyNotFound
+	}
+
+	return value, nil
+}
+
+func (db *DB) Delete(key string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		return ErrDBClosed
+	}
+	// if err := db.Write("DELETE\t" + key); err != nil {
+	// 	return err
+	// }
+
+	db.AddtoBatch(logEntry{
+		op:    "DELETE",
+		key:   key,
+		value: "",
+	})
+	delete(db.data, key)
+
+	db.opsSinceSnap++
+
+	if db.opsSinceSnap >= compactionThreshold {
+		if err := db.Flush(); err != nil {
+			return err
+		}
+		if err := db.CompactwithoutLock(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (db *DB) Close() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		return ErrDBClosed
+	}
+	close(db.shutdownChan)
+	db.flushDone.Wait()
+
+	db.wal.Close()
+	db.closed = true
+	db.data = nil
+	return nil
+}
+
+func (db *DB) Has(key string) (bool, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		return false, ErrDBClosed
+	}
+	_, exists := db.data[key]
+	return exists, nil
+}
+
+func (db *DB) Len() (int, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		return 0, ErrDBClosed
+	}
+	return len(db.data), nil
+}
+
+func (db *DB) Keys() ([]string, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		return nil, ErrDBClosed
+	}
+
+	dbkeys := []string{}
+
+	for key := range db.data {
+		dbkeys = append(dbkeys, key)
+	}
+
+	sort.Strings(dbkeys)
+	return dbkeys, nil
 }
 
 func (db *DB) CompactwithoutLock() error {
@@ -247,218 +512,70 @@ func (db *DB) LoadSnapshot() error {
 	return scanner.Err()
 }
 
-func Open(dir string) (*DB, error) {
+func (db *DB) startBackgroundFlusher() {
+	db.flushDone.Add(1)
 
-	//WAL
-	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		return nil, fmt.Errorf("directory does not exist: %s", dir)
-	}
+	go func() {
+		defer db.flushDone.Done()
 
-	walPath := filepath.Join(dir, "wal.log")
-	snapshotPath := filepath.Join(dir, "snapshot.db")
+		ticker := time.NewTicker(db.flushTimeout)
+		defer ticker.Stop()
 
-	db := &DB{
-		data:         make(map[string]string),
-		walPath:      walPath,
-		snapshotPath: snapshotPath,
-	}
-
-	//loadSnashot
-	if err := db.LoadSnapshot(); err != nil {
-		return nil, err
-	}
-
-	wal, err := os.OpenFile(walPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open WAL: %w", err)
-	}
-
-	db.wal = wal
-
-	// 5. Replay log
-	if err := db.Replay(); err != nil {
-		wal.Close()
-		return nil, err
-	}
-
-	return db, nil
+		for {
+			select {
+			case <-ticker.C:
+				db.Flush()
+			case <-db.flushSignal:
+				db.Flush()
+			case <-db.shutdownChan:
+				db.Flush()
+				return
+			}
+		}
+	}()
 }
 
-func (db *DB) Replay() error {
-	if _, err := db.wal.Seek(0, 0); err != nil {
-		return fmt.Errorf("failed to seek: %w", err)
+func (db *DB) AddtoBatch(log logEntry) {
+	db.batchMu.Lock()
+	defer db.batchMu.Unlock()
+
+	db.writeBatch = append(db.writeBatch, log)
+
+	if len(db.writeBatch) >= db.batchSize {
+		select {
+		case db.flushSignal <- struct{}{}:
+			// Signal sent successfully
+		default:
+			// Channel full, flush already pending
+		}
+	}
+}
+
+func (db *DB) Flush() error {
+	db.batchMu.Lock()
+	defer db.batchMu.Unlock()
+
+	if len(db.writeBatch) == 0 {
+		return nil
 	}
 
-	scanner := bufio.NewScanner(db.wal)
-	inTx := false
-	txWrites := make(map[string]*string)
-
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-
-		parts := strings.Split(line, "\t")
-		if len(parts) < 1 {
-			continue
-		}
-
-		switch parts[0] {
-		case "BEGIN_TX":
-			inTx = true
-			txWrites = make(map[string]*string)
-
-		case "COMMIT_TX":
-			if inTx {
-				for key, value := range txWrites {
-					if value == nil {
-						delete(db.data, key)
-					} else {
-						db.data[key] = *value
-					}
-				}
-			}
-			inTx = false
-			txWrites = make(map[string]*string)
-
-		case "SET":
-			if len(parts) != 3 {
-				continue
-			}
-			if inTx {
-				v := parts[2]
-				txWrites[parts[1]] = &v
-			} else {
-				db.data[parts[1]] = parts[2]
-			}
-
+	for _, entry := range db.writeBatch {
+		switch entry.op {
 		case "DELETE":
-			if len(parts) != 2 {
-				continue
+			if _, err := db.wal.Write([]byte("DELETE\t" + entry.key + "\n")); err != nil {
+				return err
 			}
-			if inTx {
-				txWrites[parts[1]] = nil
-			} else {
-				delete(db.data, parts[1])
+		default:
+			if _, err := db.wal.Write([]byte("SET\t" + entry.key + "\t" + entry.value + "\n")); err != nil {
+				return err
 			}
 		}
 	}
 
-	return scanner.Err()
-}
-
-func (db *DB) Write(data string) error {
-	_, err := db.wal.Write([]byte(data + "\n"))
-	if err != nil {
+	if err := db.wal.Sync(); err != nil {
 		return err
 	}
-	return db.wal.Sync()
-}
-
-func (db *DB) Set(key, value string) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	if db.closed {
-		return ErrDBClosed
-	}
-	if err := db.Write("SET\t" + key + "\t" + value); err != nil {
-		return err
-	}
-
-	db.data[key] = value
-	db.opsSinceSnap++
-
-	if db.opsSinceSnap >= compactionThreshold {
-		if err := db.CompactwithoutLock(); err != nil {
-			return err
-		}
-	}
+	db.writeBatch = db.writeBatch[:0]
 
 	return nil
-}
-
-func (db *DB) Get(key string) (string, error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-	if db.closed {
-		return "", ErrDBClosed
-	}
-	value, exists := db.data[key]
-	if !exists {
-		return "", ErrKeyNotFound
-	}
-
-	return value, nil
-}
-
-func (db *DB) Delete(key string) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	if db.closed {
-		return ErrDBClosed
-	}
-	if err := db.Write("DELETE\t" + key); err != nil {
-		return err
-	}
-	delete(db.data, key)
-
-	db.opsSinceSnap++
-
-	if db.opsSinceSnap >= compactionThreshold {
-		if err := db.CompactwithoutLock(); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (db *DB) Close() error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	if db.closed {
-		return ErrDBClosed
-	}
-
-	db.wal.Close()
-	db.closed = true
-	db.data = nil
-	return nil
-}
-
-func (db *DB) Has(key string) (bool, error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-	if db.closed {
-		return false, ErrDBClosed
-	}
-	_, exists := db.data[key]
-	return exists, nil
-}
-
-func (db *DB) Len() (int, error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-	if db.closed {
-		return 0, ErrDBClosed
-	}
-	return len(db.data), nil
-}
-
-func (db *DB) Keys() ([]string, error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-	if db.closed {
-		return nil, ErrDBClosed
-	}
-
-	dbkeys := []string{}
-
-	for key := range db.data {
-		dbkeys = append(dbkeys, key)
-	}
-
-	sort.Strings(dbkeys)
-	return dbkeys, nil
 }

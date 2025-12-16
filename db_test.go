@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestTransactionAtomicity(t *testing.T) {
@@ -349,4 +350,132 @@ func TestCompactionSizeReduction(t *testing.T) {
 	fmt.Printf("Before: WAL=%d bytes\n", sizeBefore)
 	fmt.Printf("After: Snapshot=%d bytes, WAL=%d bytes\n", snapshotSize, walSize)
 	fmt.Printf("Reduction: %.1f%%\n", 100.0*(1-float64(snapshotSize)/float64(sizeBefore)))
+}
+
+func TestBatchingPersistence(t *testing.T) {
+	dir := t.TempDir()
+	db, _ := Open(dir)
+
+	// Write 50 entries
+	for i := 0; i < 50; i++ {
+		if err := db.Set(fmt.Sprintf("key%d", i), "value"); err != nil {
+			t.Fatalf("Set failed: %v", err)
+		}
+	}
+
+	// Wait for timer flush
+	time.Sleep(20 * time.Millisecond)
+
+	db.Close()
+
+	// Reopen and verify
+	db2, _ := Open(dir)
+	defer db2.Close()
+
+	for i := 0; i < 50; i++ {
+		val, err := db2.Get(fmt.Sprintf("key%d", i))
+		if err != nil || val != "value" {
+			t.Errorf("Data not persisted for key%d", i)
+		}
+	}
+}
+
+func TestBatchFullFlush(t *testing.T) {
+	dir := t.TempDir()
+	db, _ := Open(dir)
+	db.batchSize = 10
+	defer db.Close()
+
+	// Write exactly batch size
+	for i := 0; i < 10; i++ {
+		db.Set(fmt.Sprintf("key%d", i), "value")
+	}
+
+	// Give background goroutine time to flush
+	time.Sleep(5 * time.Millisecond)
+
+	// Check batch is empty
+	db.batchMu.Lock()
+	batchLen := len(db.writeBatch)
+	db.batchMu.Unlock()
+
+	if batchLen != 0 {
+		t.Errorf("Batch should be empty after full, got %d entries", batchLen)
+	}
+}
+
+func TestExplicitFlush(t *testing.T) {
+	dir := t.TempDir()
+	db, _ := Open(dir)
+	defer db.Close()
+
+	db.Set("key", "value")
+
+	// Explicit flush
+	if err := db.Flush(); err != nil {
+		t.Fatalf("Flush failed: %v", err)
+	}
+
+	db.Close()
+
+	// Reopen and verify
+	db2, _ := Open(dir)
+	defer db2.Close()
+
+	val, err := db2.Get("key")
+	if err != nil || val != "value" {
+		t.Error("Explicit flush failed to persist data")
+	}
+}
+
+func TestCompactionFlushesFirst(t *testing.T) {
+	dir := t.TempDir()
+	db, _ := Open(dir)
+	db.batchSize = 1000
+	db.opsSinceSnap = 995
+	defer db.Close()
+
+	// Add entries near threshold
+	for i := 0; i < 10; i++ {
+		db.Set(fmt.Sprintf("key%d", i), "value")
+	}
+
+	// Should trigger compaction with flush
+
+	db.Close()
+
+	// Reopen and verify
+	db2, _ := Open(dir)
+	defer db2.Close()
+
+	for i := 0; i < 10; i++ {
+		val, err := db2.Get(fmt.Sprintf("key%d", i))
+		if err != nil || val != "value" {
+			t.Errorf("Key%d lost during compaction", i)
+		}
+	}
+}
+
+func BenchmarkWritesWithBatching(b *testing.B) {
+	dir := b.TempDir()
+	db, _ := Open(dir)
+	defer db.Close()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		db.Set(fmt.Sprintf("key%d", i), "value")
+	}
+	db.Flush()
+}
+
+func BenchmarkWritesNoBatching(b *testing.B) {
+	dir := b.TempDir()
+	db, _ := Open(dir)
+	db.batchSize = 1 // Force immediate flush
+	defer db.Close()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		db.Set(fmt.Sprintf("key%d", i), "value")
+	}
 }
