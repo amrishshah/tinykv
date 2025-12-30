@@ -479,3 +479,117 @@ func BenchmarkWritesNoBatching(b *testing.B) {
 		db.Set(fmt.Sprintf("key%d", i), "value")
 	}
 }
+
+// func TestCacheHit(t *testing.T) {
+// 	dir := t.TempDir()
+// 	db, _ := Open(dir)
+// 	defer db.Close()
+
+// 	db.Set("key", "value")
+
+// 	// First Get - cache miss
+// 	val1, _ := db.Get("key")
+
+// 	// Second Get - cache hit
+// 	val2, _ := db.Get("key")
+
+// 	if val1 != "value" || val2 != "value" {
+// 		t.Error("Cache not working")
+// 	}
+
+// 	// Check stats
+// 	hits, misses, hitRate := db.cache.Stats()
+// 	if hits != 1 || misses != 1 || hitRate != 0.5 {
+// 		t.Errorf("Expected 1 hit, 1 miss, 50%% hit rate. Got: %d hits, %d misses, %.2f%% hit rate",
+// 			hits, misses, hitRate*100)
+// 	}
+// }
+
+func TestCacheInvalidationOnSet(t *testing.T) {
+	dir := t.TempDir()
+	db, _ := Open(dir)
+	defer db.Close()
+
+	db.Set("key", "value1")
+	val1, _ := db.Get("key") // Cache miss, then cache "value1"
+
+	db.Set("key", "value2")  // Update cache
+	val2, _ := db.Get("key") // Cache hit with "value2"
+
+	if val1 != "value1" || val2 != "value2" {
+		t.Error("Cache invalidation failed")
+	}
+}
+
+func TestCacheInvalidationOnDelete(t *testing.T) {
+	dir := t.TempDir()
+	db, _ := Open(dir)
+	defer db.Close()
+
+	db.Set("key", "value")
+	db.Get("key") // Cache it
+
+	db.Delete("key") // Remove from cache
+
+	_, err := db.Get("key")
+	if err != ErrKeyNotFound {
+		t.Error("Key should be deleted")
+	}
+}
+
+func TestLRUEviction(t *testing.T) {
+	cache := NewLRUCache(3) // Capacity: 3
+
+	cache.Put("a", "1")
+	cache.Put("b", "2")
+	cache.Put("c", "3")
+
+	cache.Get("a") // Access "a" (move to front)
+
+	cache.Put("d", "4") // Evicts "b" (least recently used)
+
+	// "b" should be evicted
+	if _, ok := cache.Get("b"); ok {
+		t.Error("b should be evicted")
+	}
+
+	// "a", "c", "d" should exist
+	if _, ok := cache.Get("a"); !ok {
+		t.Error("a should exist")
+	}
+	if _, ok := cache.Get("c"); !ok {
+		t.Error("c should exist")
+	}
+	if _, ok := cache.Get("d"); !ok {
+		t.Error("d should exist")
+	}
+}
+
+func BenchmarkGetWithoutCache(b *testing.B) {
+	dir := b.TempDir()
+	db, _ := Open(dir)
+	db.cacheEnabled = false // Disable cache
+	defer db.Close()
+
+	db.Set("hot_key", "value")
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		db.Get("hot_key")
+	}
+}
+
+func BenchmarkGetWithCache(b *testing.B) {
+	dir := b.TempDir()
+	db, _ := Open(dir)
+	db.cacheEnabled = true // Enable cache
+	defer db.Close()
+
+	db.Set("hot_key", "value")
+	db.Get("hot_key") // Prime cache
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		db.Get("hot_key")
+	}
+}

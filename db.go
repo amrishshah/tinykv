@@ -170,6 +170,9 @@ type DB struct {
 	shutdownChan chan struct{}  // Signal to stop background goroutine
 	flushDone    sync.WaitGroup // Wait for flusher to finish
 
+	cache        *LRUCache
+	cacheEnabled bool // Allow disabling for testing
+
 }
 
 type logEntry struct {
@@ -197,6 +200,8 @@ func Open(dir string) (*DB, error) {
 		flushTimeout: 10 * time.Millisecond,
 		flushSignal:  make(chan struct{}, 1),
 		shutdownChan: make(chan struct{}),
+		cache:        NewLRUCache(1000),
+		cacheEnabled: true,
 	}
 
 	//loadSnashot
@@ -310,6 +315,11 @@ func (db *DB) Set(key, value string) error {
 		value: value,
 	})
 
+	//Update cache
+	if db.cacheEnabled {
+		db.cache.Put(key, value) // Update with new value
+	}
+
 	db.data[key] = value
 	db.opsSinceSnap++
 
@@ -331,9 +341,20 @@ func (db *DB) Get(key string) (string, error) {
 	if db.closed {
 		return "", ErrDBClosed
 	}
+	if db.cacheEnabled {
+		if value, exists := db.cache.Get(key); exists {
+			return value, nil
+		}
+	}
+
 	value, exists := db.data[key]
 	if !exists {
 		return "", ErrKeyNotFound
+	}
+
+	// Update cache
+	if db.cacheEnabled {
+		db.cache.Put(key, value) // Update with new value
 	}
 
 	return value, nil
@@ -354,7 +375,13 @@ func (db *DB) Delete(key string) error {
 		key:   key,
 		value: "",
 	})
+
 	delete(db.data, key)
+
+	// Invalidate cache
+	if db.cacheEnabled {
+		db.cache.Remove(key) // Remove from cache
+	}
 
 	db.opsSinceSnap++
 
@@ -378,6 +405,10 @@ func (db *DB) Close() error {
 	}
 	close(db.shutdownChan)
 	db.flushDone.Wait()
+
+	if db.cacheEnabled {
+		db.cache.Clear() // Clear cache
+	}
 
 	db.wal.Close()
 	db.closed = true
@@ -541,6 +572,7 @@ func (db *DB) AddtoBatch(log logEntry) {
 
 	db.writeBatch = append(db.writeBatch, log)
 
+	//THis is important code - when channel is already full and if you push another then it will block if used without select.
 	if len(db.writeBatch) >= db.batchSize {
 		select {
 		case db.flushSignal <- struct{}{}:
