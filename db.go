@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -21,24 +22,35 @@ var (
 const compactionThreshold = 1000 // Compact after 1000 operations
 
 type Tx struct {
-	db     *DB
-	mu     sync.Mutex
-	writes map[string]*string
-	active bool
+	db       *DB
+	mu       sync.Mutex
+	writes   map[string]*string
+	active   bool
+	txid     uint64 //Write Transaction
+	snapshot uint64 // Read Transaction ..
 }
 
 func (db *DB) Begin() (*Tx, error) {
-	db.mu.Lock()
+
 	if db.closed {
-		db.mu.Unlock()
 		return nil, ErrDBClosed
 	}
 
-	return &Tx{
-		db:     db,
-		writes: make(map[string]*string),
-		active: true,
-	}, nil
+	txid := atomic.AddUint64(&db.nextTXID, 1)
+
+	tx := &Tx{
+		db:       db,
+		txid:     txid,
+		snapshot: txid,
+		writes:   make(map[string]*string),
+		active:   true,
+	}
+
+	db.activeTxMu.Lock()
+	db.activeTxs[txid] = tx
+	db.activeTxMu.Unlock()
+
+	return tx, nil
 }
 
 func (tx *Tx) Set(key, value string) error {
@@ -80,9 +92,9 @@ func (tx *Tx) Get(key string) (string, error) {
 		}
 	}
 
-	value, exists := tx.db.data[key]
-	if !exists {
-		return "", ErrKeyNotFound
+	value, err := tx.db.data.Get(key, tx.snapshot)
+	if err != nil {
+		return "", err
 	}
 
 	return value, nil
@@ -91,20 +103,27 @@ func (tx *Tx) Get(key string) (string, error) {
 
 func (tx *Tx) Rollback() error {
 	tx.mu.Lock()
-	defer tx.db.mu.Unlock()
 	defer tx.mu.Unlock()
+
 	if !tx.active {
 		return ErrTxNotActive
 	}
+
 	tx.active = false
 	tx.writes = nil
+
+	// Unregister transaction
+	tx.db.activeTxMu.Lock()
+	delete(tx.db.activeTxs, tx.txid)
+	tx.db.activeTxMu.Unlock()
+
 	return nil
 }
 
 func (tx *Tx) Commit() error {
 	tx.mu.Lock()
-	defer tx.db.mu.Unlock()
 	defer tx.mu.Unlock()
+
 	if !tx.active {
 		return ErrTxNotActive
 	}
@@ -114,18 +133,25 @@ func (tx *Tx) Commit() error {
 		return err
 	}
 
-	if err := tx.db.Write("BEGIN_TX"); err != nil {
+	// Acquire db.mu for writing to WAL and updating data
+	tx.db.mu.Lock()
+	defer tx.db.mu.Unlock()
+
+	// Write transaction marker with TXID
+	if err := tx.db.Write(fmt.Sprintf("BEGIN_TX\t%d", tx.txid)); err != nil {
 		return err
 	}
 
 	for key, value := range tx.writes {
 		switch value {
 		case nil:
-			if err := tx.db.Write("DELETE\t" + key); err != nil {
+			// Include TXID
+			if err := tx.db.Write(fmt.Sprintf("DELETE\t%d\t%s", tx.txid, key)); err != nil {
 				return err
 			}
 		default:
-			if err := tx.db.Write("SET\t" + key + "\t" + *value); err != nil {
+			// Include TXID
+			if err := tx.db.Write(fmt.Sprintf("SET\t%d\t%s\t%s", tx.txid, key, *value)); err != nil {
 				return err
 			}
 		}
@@ -137,14 +163,86 @@ func (tx *Tx) Commit() error {
 
 	tx.active = false
 
-	//update Memory
+	// Update memory with versioned data
 	for key, value := range tx.writes {
 		switch value {
 		case nil:
-			delete(tx.db.data, key)
+			tx.db.data.Delete(key, tx.txid)
 		default:
-			tx.db.data[key] = *value
+			tx.db.data.Set(key, *value, tx.txid)
 		}
+	}
+
+	// Unregister transaction
+	tx.db.activeTxMu.Lock()
+	delete(tx.db.activeTxs, tx.txid)
+	tx.db.activeTxMu.Unlock()
+
+	return nil
+}
+
+type Version struct {
+	value string
+	xmin  uint64
+	xmax  uint64
+	next  *Version
+}
+
+type VersionData struct {
+	mv       sync.RWMutex
+	versions map[string]*Version
+}
+
+func NewVersionedData() *VersionData {
+	return &VersionData{
+		versions: make(map[string]*Version),
+	}
+}
+
+func (vd *VersionData) Set(key, value string, txid uint64) {
+	vd.mv.Lock()
+	defer vd.mv.Unlock()
+
+	// Mark old version as superseded
+	if oldVersion := vd.versions[key]; oldVersion != nil && oldVersion.xmax == 0 {
+		oldVersion.xmax = txid // Mark as replaced by this transaction
+	}
+
+	newversion := &Version{
+		value: value,
+		xmin:  txid,
+		xmax:  0,
+		next:  vd.versions[key],
+	}
+
+	vd.versions[key] = newversion
+}
+
+func (vd *VersionData) Get(key string, snapshot uint64) (string, error) {
+	vd.mv.RLock()
+	defer vd.mv.RUnlock()
+	version := vd.versions[key]
+	for version != nil {
+		if version.xmin <= snapshot && (version.xmax == 0 || version.xmax > snapshot) {
+			return version.value, nil
+		}
+		version = version.next
+	}
+	return "", ErrKeyNotFound
+}
+
+func (vd *VersionData) Delete(key string, txid uint64) error {
+	vd.mv.Lock()
+	defer vd.mv.Unlock()
+
+	version := vd.versions[key]
+	if version == nil {
+		return ErrKeyNotFound
+	}
+
+	// Mark current version as deleted
+	if version.xmax == 0 {
+		version.xmax = txid
 	}
 
 	return nil
@@ -152,13 +250,17 @@ func (tx *Tx) Commit() error {
 
 type DB struct {
 	mu           sync.RWMutex
-	data         map[string]string
+	data         *VersionData
 	closed       bool
 	wal          *os.File
 	walPath      string
 	snapshotPath string
 	lastSnapshot uint64 // NEW - operation count at last snapshot
 	opsSinceSnap uint64 // NEW - operations since last snapshot
+
+	nextTXID   uint64         // Atomic counter
+	activeTxs  map[uint64]*Tx // Track active transactions
+	activeTxMu sync.RWMutex
 
 	writeBatch   []logEntry
 	batchMu      sync.Mutex
@@ -173,12 +275,17 @@ type DB struct {
 	cache        *LRUCache
 	cacheEnabled bool // Allow disabling for testing
 
+	gcInterval time.Duration
+	gcDone     sync.WaitGroup
+	lastGCTime time.Time
+	gcRunning  atomic.Bool
 }
 
 type logEntry struct {
 	op    string // SET and DELETE
 	key   string
 	value string // empty for delete
+	txid  uint64
 }
 
 func Open(dir string) (*DB, error) {
@@ -192,7 +299,7 @@ func Open(dir string) (*DB, error) {
 	snapshotPath := filepath.Join(dir, "snapshot.db")
 
 	db := &DB{
-		data:         make(map[string]string),
+		data:         NewVersionedData(),
 		walPath:      walPath,
 		snapshotPath: snapshotPath,
 		writeBatch:   make([]logEntry, 0, 100),
@@ -202,6 +309,9 @@ func Open(dir string) (*DB, error) {
 		shutdownChan: make(chan struct{}),
 		cache:        NewLRUCache(1000),
 		cacheEnabled: true,
+		nextTXID:     0,
+		activeTxs:    make(map[uint64]*Tx),
+		gcInterval:   30 * time.Second,
 	}
 
 	//loadSnashot
@@ -223,6 +333,7 @@ func Open(dir string) (*DB, error) {
 	}
 
 	db.startBackgroundFlusher()
+	db.startBackgroundGC()
 
 	return db, nil
 }
@@ -234,6 +345,7 @@ func (db *DB) Replay() error {
 
 	scanner := bufio.NewScanner(db.wal)
 	inTx := false
+	var currentTxid uint64
 	txWrites := make(map[string]*string)
 
 	for scanner.Scan() {
@@ -249,16 +361,26 @@ func (db *DB) Replay() error {
 
 		switch parts[0] {
 		case "BEGIN_TX":
+			// Format: BEGIN_TX	<txid>
+			if len(parts) >= 2 {
+				fmt.Sscanf(parts[1], "%d", &currentTxid)
+
+				// Update nextTXID
+				if currentTxid >= db.nextTXID {
+					db.nextTXID = currentTxid + 1
+				}
+			}
 			inTx = true
 			txWrites = make(map[string]*string)
 
 		case "COMMIT_TX":
 			if inTx {
+				// Apply all buffered writes with proper TXID
 				for key, value := range txWrites {
 					if value == nil {
-						delete(db.data, key)
+						db.data.Delete(key, currentTxid)
 					} else {
-						db.data[key] = *value
+						db.data.Set(key, *value, currentTxid)
 					}
 				}
 			}
@@ -266,24 +388,46 @@ func (db *DB) Replay() error {
 			txWrites = make(map[string]*string)
 
 		case "SET":
-			if len(parts) != 3 {
-				continue
-			}
 			if inTx {
-				v := parts[2]
-				txWrites[parts[1]] = &v
+				// Inside transaction: Format is SET	<txid>	<key>	<value>
+				if len(parts) >= 4 {
+					v := parts[3]
+					txWrites[parts[2]] = &v
+				}
 			} else {
-				db.data[parts[1]] = parts[2]
+				// Outside transaction: Format is SET	<txid>	<key>	<value>
+				if len(parts) >= 4 {
+					var txid uint64
+					fmt.Sscanf(parts[1], "%d", &txid)
+
+					// Update nextTXID
+					if txid >= db.nextTXID {
+						db.nextTXID = txid + 1
+					}
+
+					db.data.Set(parts[2], parts[3], txid)
+				}
 			}
 
 		case "DELETE":
-			if len(parts) != 2 {
-				continue
-			}
 			if inTx {
-				txWrites[parts[1]] = nil
+				// Inside transaction: Format is DELETE	<txid>	<key>
+				if len(parts) >= 3 {
+					txWrites[parts[2]] = nil
+				}
 			} else {
-				delete(db.data, parts[1])
+				// Outside transaction: Format is DELETE	<txid>	<key>
+				if len(parts) >= 3 {
+					var txid uint64
+					fmt.Sscanf(parts[1], "%d", &txid)
+
+					// Update nextTXID
+					if txid >= db.nextTXID {
+						db.nextTXID = txid + 1
+					}
+
+					db.data.Delete(parts[2], txid)
+				}
 			}
 		}
 	}
@@ -309,10 +453,13 @@ func (db *DB) Set(key, value string) error {
 	// 	return err
 	// }
 
+	txid := atomic.AddUint64(&db.nextTXID, 1)
+
 	db.AddtoBatch(logEntry{
 		op:    "SET",
 		key:   key,
 		value: value,
+		txid:  txid,
 	})
 
 	//Update cache
@@ -320,7 +467,8 @@ func (db *DB) Set(key, value string) error {
 		db.cache.Put(key, value) // Update with new value
 	}
 
-	db.data[key] = value
+	db.data.Set(key, value, txid)
+
 	db.opsSinceSnap++
 
 	if db.opsSinceSnap >= compactionThreshold {
@@ -346,10 +494,11 @@ func (db *DB) Get(key string) (string, error) {
 			return value, nil
 		}
 	}
+	const maxSnapshot = ^uint64(0)
 
-	value, exists := db.data[key]
-	if !exists {
-		return "", ErrKeyNotFound
+	value, err := db.data.Get(key, maxSnapshot)
+	if err != nil {
+		return "", err
 	}
 
 	// Update cache
@@ -370,13 +519,16 @@ func (db *DB) Delete(key string) error {
 	// 	return err
 	// }
 
+	txid := atomic.AddUint64(&db.nextTXID, 1)
+
 	db.AddtoBatch(logEntry{
 		op:    "DELETE",
 		key:   key,
 		value: "",
+		txid:  txid,
 	})
 
-	delete(db.data, key)
+	db.data.Delete(key, txid)
 
 	// Invalidate cache
 	if db.cacheEnabled {
@@ -405,6 +557,7 @@ func (db *DB) Close() error {
 	}
 	close(db.shutdownChan)
 	db.flushDone.Wait()
+	db.gcDone.Wait()
 
 	if db.cacheEnabled {
 		db.cache.Clear() // Clear cache
@@ -419,34 +572,46 @@ func (db *DB) Close() error {
 func (db *DB) Has(key string) (bool, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
+
 	if db.closed {
 		return false, ErrDBClosed
 	}
-	_, exists := db.data[key]
-	return exists, nil
+
+	const maxSnapshot = ^uint64(0)
+	_, err := db.data.Get(key, maxSnapshot)
+
+	return err == nil, nil
 }
 
 func (db *DB) Len() (int, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
+
 	if db.closed {
 		return 0, ErrDBClosed
 	}
-	return len(db.data), nil
+
+	db.data.mv.RLock()
+	count := len(db.data.versions)
+	db.data.mv.RUnlock()
+
+	return count, nil
 }
 
 func (db *DB) Keys() ([]string, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
+
 	if db.closed {
 		return nil, ErrDBClosed
 	}
 
-	dbkeys := []string{}
-
-	for key := range db.data {
+	db.data.mv.RLock()
+	dbkeys := make([]string, 0, len(db.data.versions))
+	for key := range db.data.versions {
 		dbkeys = append(dbkeys, key)
 	}
+	db.data.mv.RUnlock()
 
 	sort.Strings(dbkeys)
 	return dbkeys, nil
@@ -493,25 +658,38 @@ func (db *DB) Snapshot() error {
 	if err != nil {
 		return fmt.Errorf("failed to create snapshot: %w", err)
 	}
-
 	defer tempsnap.Close()
 
-	for key, value := range db.data {
-		if _, err := tempsnap.Write([]byte(key + "\t" + value + "\n")); err != nil {
-			return fmt.Errorf("failed to write snapshot: %w", err)
+	db.data.mv.RLock()
+	const maxSnapshot = ^uint64(0) // See all committed data
+
+	// Write each key's latest visible version
+	for key, version := range db.data.versions {
+		curr := version
+		for curr != nil {
+			if curr.xmin <= maxSnapshot && (curr.xmax == 0 || curr.xmax > maxSnapshot) {
+				line := fmt.Sprintf("%s\t%s\t%d\t%d\n", key, curr.value, curr.xmin, curr.xmax)
+				if _, err := tempsnap.Write([]byte(line)); err != nil {
+					db.data.mv.RUnlock()
+					return fmt.Errorf("failed to write snapshot: %w", err)
+				}
+				break
+			}
+			curr = curr.next
 		}
 	}
+	db.data.mv.RUnlock()
 
 	if err := tempsnap.Sync(); err != nil {
 		return err
 	}
 
-	// Close before rename (required on Windows)
 	tempsnap.Close()
 
 	if err := os.Rename(tempPath, db.snapshotPath); err != nil {
 		return err
 	}
+
 	return nil
 }
 
@@ -519,27 +697,53 @@ func (db *DB) LoadSnapshot() error {
 	if _, err := os.Stat(db.snapshotPath); os.IsNotExist(err) {
 		return nil
 	}
+
 	snap, err := os.Open(db.snapshotPath)
 	if err != nil {
 		return err
 	}
-
 	defer snap.Close()
 
 	scanner := bufio.NewScanner(snap)
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-
 		if line == "" {
 			continue
 		}
-		part := strings.Split(line, "\t")
-		if len(part) < 2 {
+
+		parts := strings.Split(line, "\t")
+		if len(parts) < 4 {
 			continue
 		}
-		db.data[part[0]] = part[1]
+
+		key := parts[0]
+		value := parts[1]
+		var xmin, xmax uint64
+		fmt.Sscanf(parts[2], "%d", &xmin)
+		fmt.Sscanf(parts[3], "%d", &xmax)
+
+		// Reconstruct version
+		version := &Version{
+			value: value,
+			xmin:  xmin,
+			xmax:  xmax,
+			next:  nil,
+		}
+
+		db.data.mv.Lock()
+		db.data.versions[key] = version
+		db.data.mv.Unlock()
+
+		// Update nextTXID
+		if xmin >= db.nextTXID {
+			db.nextTXID = xmin + 1
+		}
+		if xmax > 0 && xmax >= db.nextTXID {
+			db.nextTXID = xmax + 1
+		}
 	}
+
 	return scanner.Err()
 }
 
@@ -592,22 +796,97 @@ func (db *DB) Flush() error {
 	}
 
 	for _, entry := range db.writeBatch {
+		var line string
 		switch entry.op {
 		case "DELETE":
-			if _, err := db.wal.Write([]byte("DELETE\t" + entry.key + "\n")); err != nil {
-				return err
-			}
+			// Include TXID in WAL
+			line = fmt.Sprintf("DELETE\t%d\t%s", entry.txid, entry.key)
 		default:
-			if _, err := db.wal.Write([]byte("SET\t" + entry.key + "\t" + entry.value + "\n")); err != nil {
-				return err
-			}
+			// Include TXID in WAL
+			line = fmt.Sprintf("SET\t%d\t%s\t%s", entry.txid, entry.key, entry.value)
+		}
+
+		if _, err := db.wal.Write([]byte(line + "\n")); err != nil {
+			return err
 		}
 	}
 
 	if err := db.wal.Sync(); err != nil {
 		return err
 	}
+
 	db.writeBatch = db.writeBatch[:0]
 
 	return nil
+}
+
+func (db *DB) GarbageCollect() int {
+
+	if !db.gcRunning.CompareAndSwap(false, true) {
+		return 0 // GC already running
+	}
+
+	defer db.gcRunning.Store(false)
+
+	db.activeTxMu.RLock()
+
+	// Find oldest active transaction
+	oldestSnapshot := db.nextTXID
+	for _, tx := range db.activeTxs {
+		if tx.snapshot < oldestSnapshot {
+			oldestSnapshot = tx.snapshot
+		}
+	}
+	db.activeTxMu.RUnlock()
+
+	// Clean versions older than oldest snapshot
+	db.data.mv.Lock()
+	defer db.data.mv.Unlock()
+
+	versionsRemoved := 0
+
+	for _, version := range db.data.versions {
+		// Keep latest version always
+		if version.next == nil {
+			continue
+		}
+
+		// Walk chain, remove old versions
+		prev := version
+		curr := version.next
+
+		for curr != nil {
+			// If this version is invisible to all active txs
+			if curr.xmax != 0 && curr.xmax < oldestSnapshot {
+				// Remove from chain
+				prev.next = curr.next
+				versionsRemoved++
+
+				curr = curr.next
+			} else {
+				prev = curr
+				curr = curr.next
+			}
+		}
+	}
+	db.lastGCTime = time.Now()
+	return versionsRemoved
+}
+
+func (db *DB) startBackgroundGC() {
+	db.gcDone.Add(1)
+
+	go func() {
+		defer db.gcDone.Done()
+		ticker := time.NewTicker(db.gcInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				db.GarbageCollect()
+			case <-db.shutdownChan:
+				return
+			}
+		}
+	}()
 }
